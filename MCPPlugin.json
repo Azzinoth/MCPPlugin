@@ -4,7 +4,7 @@
 	"Version": "1.0.0",
 	"Description": "MCP (Model Context Protocol) server that lets AI assistants such as Claude inspect and edit scenes through tools; applications and plugins can register their own tools. Requires PythonPlugin.",
 	"SupportedOS": [ "Windows" ],
-	"Dependencies": [],
+	"Dependencies": [ "a1262d03-a32d-4dbe-aa78-faf2e862ce72" ],
 	"Modules": [
 		{
 			"ID": "4541988c-5ac7-4481-a60a-26ad1dfe5400",
@@ -13,7 +13,7 @@
 			"EntryPointFileName": "MCPPlugin.dll",
 			"SupportedOS": [ "Windows" ],
 			"SupportedGraphicsModes": [ "OnScreen", "Offscreen", "None" ],
-			"Dependencies": []
+			"Dependencies": [ "75f947e1-b47e-464c-834e-8305a4d7e886" ]
 		}
 	]
 }
