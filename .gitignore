@@ -22,6 +22,10 @@ cmake_install.cmake
 
 # Prebuilt third party DLLs are needed to run plugin from fresh clone.
 !ThirdParty/**/*.dll
+# Vendored Python packages also need their metadata, licenses and executables.
+!ThirdParty/**/*.txt
+!ThirdParty/**/*.exe
+__pycache__/
 
 #Folders
 # Build folders are anchored to root, otherwise ThirdParty/*/Debug/ and ThirdParty/*/Release/ would be ignored too.

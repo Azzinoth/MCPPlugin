@@ -100,6 +100,7 @@ file(GLOB Connection_To_Engine_SRC
 file(GLOB Main_SRC
 	"MCPPlugin.h"
 	"MCPPlugin.cpp"
+	"SubSystems/PythonPlugin/PythonPluginInterface.h"
 )
 
 # Public headers of plugin API, applications include them and get plugin through PLUGIN_MANAGER.GetPlugin<T>.
@@ -244,6 +245,12 @@ if(Main_SRC)
 
     # set the startup project
     set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
+
+    # Manifest and Python files are not build inputs, so Visual Studio skips the project when only they changed, custom target runs on every build.
+    add_custom_target(${PROJECT_NAME}Data ALL
+        COMMAND ${CMAKE_COMMAND} -D "SOURCE_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}" -D "BINARY_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}" -D PLUGIN_NAME=${PROJECT_NAME} -P "${CMAKE_CURRENT_SOURCE_DIR}/BuildManagement/CopyPluginData.cmake"
+    )
+    add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}Data)
 endif()
 
 # Applications that generate plugin project could add more modules here, for example editor adds editor module.
