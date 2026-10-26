@@ -1,0 +1,4 @@
+[submodule "SubSystems/FocalEngine"]
+	path = SubSystems/FocalEngine
+	url = https://github.com/Azzinoth/FocalEngine
+	branch = plugins

@@ -1,0 +1,253 @@
+cmake_minimum_required(VERSION 3.15)
+
+set(BUILD_TYPE "Debug and Release" CACHE STRING "Choose Build type")
+set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_CONFIGURATION_TYPES Debug Release)
+
+add_definitions(-DUNICODE)
+add_definitions(-D_UNICODE)
+
+set(PROJECT_NAME MCPPlugin)
+
+project(${PROJECT_NAME})
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Set compiler flags based on USE_STATIC_RUNTIME
+if(MSVC)
+    # Disable C4251 warning
+    add_compile_options(/wd4251)
+
+    # Runtime is set as default for targets, so static libraries of modules could use static runtime.
+    if(USE_STATIC_RUNTIME)
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    else()
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    endif()
+
+    # Always add /MP for multi-processor compilation
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D FE_GRAPHICS_API_OPENGL")
+endif()
+
+# Turn on the ability to create folders to organize projects (.vcproj)
+# It creates "CMakePredefinedTargets" folder by default and adds CMake
+# defined projects like INSTALL.vcproj and ZERO_CHECK.vcproj
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
+# *************** FOCAL ENGINE ***************
+# Engine comes as git submodule, it is not part of plugin VS project, plugin only needs engine headers and import libraries.
+# Engine is built only when its libraries are missing in EngineLibs, delete that folder to rebuild engine after submodule update.
+set(FOCAL_ENGINE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine")
+set(FOCAL_ENGINE_LIBS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/EngineLibs")
+set(FOCAL_ENGINE_BUILD_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/EngineBuild")
+set(FOCAL_ENGINE_CONFIGURATIONS Debug Release)
+set(FOCAL_ENGINE_LIBRARIES FocalEngine FEBasicApplication)
+
+if(NOT EXISTS "${FOCAL_ENGINE_DIRECTORY}/CMakeLists.txt" OR NOT EXISTS "${FOCAL_ENGINE_DIRECTORY}/SubSystems/FEBasicApplication/CMakeLists.txt")
+    message(FATAL_ERROR "Focal Engine submodule is missing, run: git submodule update --init --recursive")
+endif()
+
+set(bFocalEngineLibrariesMissing OFF)
+foreach(Configuration ${FOCAL_ENGINE_CONFIGURATIONS})
+    foreach(Library ${FOCAL_ENGINE_LIBRARIES})
+        if(NOT EXISTS "${FOCAL_ENGINE_LIBS_DIRECTORY}/${Configuration}/${Library}.lib")
+            set(bFocalEngineLibrariesMissing ON)
+        endif()
+    endforeach()
+endforeach()
+
+if(bFocalEngineLibrariesMissing)
+    message(STATUS "Focal Engine libraries are missing, building engine from submodule, it could take a while.")
+
+    # Engine should be built with the same options that editor uses: shared libraries with dynamic runtime.
+    set(EngineConfigureCommand ${CMAKE_COMMAND} -S "${FOCAL_ENGINE_DIRECTORY}" -B "${FOCAL_ENGINE_BUILD_DIRECTORY}" -G "${CMAKE_GENERATOR}" -DBUILD_SHARED_LIBS=ON -DUSE_STATIC_RUNTIME=OFF)
+    if(CMAKE_GENERATOR_PLATFORM)
+        list(APPEND EngineConfigureCommand -A "${CMAKE_GENERATOR_PLATFORM}")
+    endif()
+
+    execute_process(COMMAND ${EngineConfigureCommand} RESULT_VARIABLE EngineConfigureResult)
+    if(NOT EngineConfigureResult EQUAL 0)
+        message(FATAL_ERROR "Focal Engine configure failed with error ${EngineConfigureResult}")
+    endif()
+
+    foreach(Configuration ${FOCAL_ENGINE_CONFIGURATIONS})
+        # FocalEngine target also builds FEBasicApplication, because engine depends on it.
+        execute_process(COMMAND ${CMAKE_COMMAND} --build "${FOCAL_ENGINE_BUILD_DIRECTORY}" --target FocalEngine --config ${Configuration} RESULT_VARIABLE EngineBuildResult)
+        if(NOT EngineBuildResult EQUAL 0)
+            message(FATAL_ERROR "Focal Engine ${Configuration} build failed with error ${EngineBuildResult}")
+        endif()
+
+        foreach(Library ${FOCAL_ENGINE_LIBRARIES})
+            # Library location depends on engine build layout, so it is searched for instead of being hardcoded.
+            file(GLOB_RECURSE FoundLibraries "${FOCAL_ENGINE_BUILD_DIRECTORY}/${Library}.lib")
+            list(FILTER FoundLibraries INCLUDE REGEX "/${Configuration}/${Library}\\.lib$")
+            list(LENGTH FoundLibraries FoundLibrariesCount)
+            if(NOT FoundLibrariesCount EQUAL 1)
+                message(FATAL_ERROR "Expected one ${Configuration} ${Library}.lib in ${FOCAL_ENGINE_BUILD_DIRECTORY}, found: ${FoundLibraries}")
+            endif()
+
+            file(COPY ${FoundLibraries} DESTINATION "${FOCAL_ENGINE_LIBS_DIRECTORY}/${Configuration}")
+        endforeach()
+    endforeach()
+endif()
+
+file(GLOB Connection_To_Engine_SRC
+	"SubSystems/FocalEngine/SubSystems/PluginSystem/FEPluginConnector.cpp"
+    "SubSystems/FocalEngine/SubSystems/PluginSystem/FEPluginConnector.h"
+)
+
+file(GLOB Main_SRC
+	"MCPPlugin.h"
+	"MCPPlugin.cpp"
+)
+
+# Public headers of plugin API, applications include them and get plugin through PLUGIN_MANAGER.GetPlugin<T>.
+file(GLOB Public_SRC "Public/*.h" "Public/Editor/*.h")
+
+link_directories(${GLEW_LIB_DIR})
+link_directories(${GLFW_LIB_DIR})
+
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine/SubSystems/FEBasicApplication
+    ${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine/SubSystems/FEBasicApplication/SubSystems
+    ${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine/SubSystems/FEBasicApplication/ThirdParty
+    ${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine/SubSystems/FEBasicApplication/ThirdParty/stduuid
+    ${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine/SubSystems/FEBasicApplication/ThirdParty/glew2/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine
+    ${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine/ThirdParty
+    ${CMAKE_CURRENT_SOURCE_DIR}/SubSystems/FocalEngine/ThirdParty/entt
+)
+
+# Creates one plugin module DLL, every module of the plugin is set up the same way.
+# With STATIC_LIBRARY module also gets static library, that games link instead of DLL.
+# Usage: fe_add_plugin_module(TargetName [STATIC_LIBRARY] SOURCES File1.h File1.cpp ...)
+function(fe_add_plugin_module TARGET_NAME)
+    cmake_parse_arguments(MODULE "STATIC_LIBRARY" "" "SOURCES" ${ARGN})
+
+    add_library(${TARGET_NAME}
+        SHARED
+            ${MODULE_SOURCES}
+            ${Public_SRC}
+            ${Connection_To_Engine_SRC}
+    )
+
+    target_link_libraries(${TARGET_NAME}
+        PRIVATE
+            debug ${FOCAL_ENGINE_LIBS_DIRECTORY}/Debug/FEBasicApplication.lib
+            optimized ${FOCAL_ENGINE_LIBS_DIRECTORY}/Release/FEBasicApplication.lib
+            debug ${FOCAL_ENGINE_LIBS_DIRECTORY}/Debug/FocalEngine.lib
+            optimized ${FOCAL_ENGINE_LIBS_DIRECTORY}/Release/FocalEngine.lib
+    )
+
+    # FocalEngine is headers-only, we need to add its include directories
+    target_include_directories(${TARGET_NAME} PRIVATE ${FOCAL_ENGINE_INCLUDES})
+    target_compile_definitions(${TARGET_NAME} PRIVATE FOCAL_ENGINE_HEADERS_ONLY FEBASICAPPLICATION_SHARED FOCAL_ENGINE_SHARED)
+
+    target_compile_definitions(${TARGET_NAME} PRIVATE $<$<CONFIG:Debug>:FE_DEBUG_ENABLED>)
+
+    source_group("Source Files/" FILES ${MODULE_SOURCES})
+    source_group("Source Files/Public/" FILES ${Public_SRC})
+    source_group("Source Files/Engine/" FILES ${Connection_To_Engine_SRC})
+
+    # Gather files that plugin manager needs in one folder, DLL name gets configuration postfix.
+    add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/Build"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${TARGET_NAME}>" "${CMAKE_CURRENT_SOURCE_DIR}/Build/${TARGET_NAME}_$<CONFIG>.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}.json" "${CMAKE_CURRENT_SOURCE_DIR}/Build/"
+    )
+
+    # Copy public headers, applications include them to call plugin API.
+    if(Public_SRC)
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/Public" "${CMAKE_CURRENT_SOURCE_DIR}/Build/Public"
+        )
+    endif()
+
+    # Build other configuration too, so both DLLs in Build folder are always up to date.
+    add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -D BUILT_CONFIGURATION=$<CONFIG> -D "BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}" -D TARGET_NAME=${TARGET_NAME} -P "${CMAKE_CURRENT_SOURCE_DIR}/BuildManagement/BuildOtherConfiguration.cmake"
+    )
+
+    if(MODULE_STATIC_LIBRARY)
+        add_library(${TARGET_NAME}_Static
+            STATIC
+                ${MODULE_SOURCES}
+                ${Public_SRC}
+                ${Connection_To_Engine_SRC}
+        )
+
+        # Games link engine statically, with static runtime and static GLEW.
+        set_target_properties(${TARGET_NAME}_Static PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_include_directories(${TARGET_NAME}_Static PRIVATE ${FOCAL_ENGINE_INCLUDES})
+        target_compile_definitions(${TARGET_NAME}_Static PRIVATE FOCAL_ENGINE_HEADERS_ONLY GLEW_STATIC $<$<CONFIG:Debug>:FE_DEBUG_ENABLED>)
+
+        add_custom_command(TARGET ${TARGET_NAME}_Static POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/Build/Static"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${TARGET_NAME}_Static>" "${CMAKE_CURRENT_SOURCE_DIR}/Build/Static/${TARGET_NAME}_$<CONFIG>.lib"
+        )
+
+        # Static library is built together with DLL, in both configurations.
+        add_dependencies(${TARGET_NAME} ${TARGET_NAME}_Static)
+        set_property(GLOBAL APPEND PROPERTY FE_PLUGIN_STATIC_MODULES ${TARGET_NAME})
+    endif()
+endfunction()
+
+# Writes Build/Static/<PluginName>.cmake, games include it to link static libraries of modules together with what they depend on.
+# LIBRARIES are library files, that are copied next to it, or names of system libraries. LINK_OPTIONS are added to the game link.
+# Usage: fe_write_static_link_file([LIBRARIES Library1.lib ...] [LINK_OPTIONS Option1 ...])
+function(fe_write_static_link_file)
+    cmake_parse_arguments(STATIC_LINK "" "" "LIBRARIES;LINK_OPTIONS" ${ARGN})
+
+    get_property(StaticModules GLOBAL PROPERTY FE_PLUGIN_STATIC_MODULES)
+    if(NOT StaticModules)
+        return()
+    endif()
+
+    set(StaticDirectory "${CMAKE_CURRENT_SOURCE_DIR}/Build/Static")
+    file(MAKE_DIRECTORY "${StaticDirectory}")
+
+    set(LinkLibraries "")
+    set(LinkOptions "")
+    foreach(Module ${StaticModules})
+        # Nothing references static registration of REGISTER_PLUGIN, so without /WHOLEARCHIVE linker would drop it.
+        list(APPEND LinkLibraries "\${CMAKE_CURRENT_LIST_DIR}/${Module}_Release.lib")
+        list(APPEND LinkOptions "/WHOLEARCHIVE:\${CMAKE_CURRENT_LIST_DIR}/${Module}_Release.lib")
+    endforeach()
+
+    foreach(Library ${STATIC_LINK_LIBRARIES})
+        if(EXISTS "${Library}")
+            file(COPY "${Library}" DESTINATION "${StaticDirectory}")
+            get_filename_component(LibraryFileName "${Library}" NAME)
+            list(APPEND LinkLibraries "\${CMAKE_CURRENT_LIST_DIR}/${LibraryFileName}")
+        else()
+            list(APPEND LinkLibraries "${Library}")
+        endif()
+    endforeach()
+
+    list(APPEND LinkOptions ${STATIC_LINK_LINK_OPTIONS})
+
+    file(WRITE "${StaticDirectory}/${PROJECT_NAME}.cmake"
+        "# Generated by CMakeLists.txt of ${PROJECT_NAME}, games include it to link plugin statically.\n"
+        "if(NOT TARGET ${PROJECT_NAME}::Static)\n"
+        "    add_library(${PROJECT_NAME}::Static INTERFACE IMPORTED)\n"
+        "    set_target_properties(${PROJECT_NAME}::Static PROPERTIES\n"
+        "        INTERFACE_LINK_LIBRARIES \"${LinkLibraries}\"\n"
+        "        INTERFACE_LINK_OPTIONS \"${LinkOptions}\")\n"
+        "endif()"
+    )
+endfunction()
+
+# Plugin without main module gets all its modules from AdditionalModules.cmake.
+if(Main_SRC)
+    fe_add_plugin_module(${PROJECT_NAME} STATIC_LIBRARY SOURCES ${Main_SRC})
+
+    # set the startup project
+    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
+endif()
+
+# Applications that generate plugin project could add more modules here, for example editor adds editor module.
+include(${CMAKE_CURRENT_SOURCE_DIR}/AdditionalModules.cmake OPTIONAL)
+
+# After all modules are added.
+fe_write_static_link_file()
