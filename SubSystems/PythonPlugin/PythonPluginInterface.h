@@ -1,12 +1,14 @@
 #pragma once
+#include <functional>
 #include <string>
 
 // Public API of PythonPlugin, applications include only this header.
 // Usage:
 //	using PluginInterface = PythonPluginInterface;
 //	PluginInterface* Plugin = PLUGIN_MANAGER.GetPlugin<PluginInterface>(UNIQUE_ID.FromString(PluginInterface::PluginID));
-//	if (Plugin != nullptr && Plugin->GetInterfaceVersion() == PluginInterface::InterfaceVersion)
+//	if (Plugin != nullptr && Plugin->GetInterfaceVersion() >= PluginInterface::InterfaceVersion)
 //		Plugin->...;
+// Functions are only appended, so plugin with newer version works with code that was built with older header.
 class PythonPluginInterface
 {
 public:
@@ -14,7 +16,7 @@ public:
 	static constexpr const char* PluginID = "a1262d03-a32d-4dbe-aa78-faf2e862ce72";
 
 	// Increase when anything in this file changes.
-	static constexpr int InterfaceVersion = 1;
+	static constexpr int InterfaceVersion = 2;
 
 	struct ExecutionResult
 	{
@@ -47,4 +49,14 @@ public:
 	virtual bool AddModuleSearchPath(const std::string& DirectoryPath) = 0;
 	// Checks that module could be imported, without importing it.
 	virtual bool IsModuleAvailable(const std::string& ModuleName) = 0;
+
+	// Version 2.
+	// Lets other plugins and applications expose C++ functions to Python without linking Python,
+	// Python calls them with focalengine.call_native_function(name, arguments_json).
+	// Function gets and returns JSON text and runs on main thread, exception that it throws is raised in Python as RuntimeError.
+	using NativeFunction = std::function<std::string(const std::string& ArgumentsJSON)>;
+	// Main thread only, returns false if function with that name is already registered.
+	virtual bool RegisterNativeFunction(const std::string& OwnerName, const std::string& FunctionName, NativeFunction Function) = 0;
+	// Main thread only, module should call it before it is unloaded, because Python would call into unloaded code otherwise.
+	virtual void UnregisterNativeFunctions(const std::string& OwnerName) = 0;
 };
