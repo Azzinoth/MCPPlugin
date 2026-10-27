@@ -11,16 +11,29 @@ class ToolError(Exception):
     """Returned to client as tool result with is_error set, so model could correct its call."""
 
 
+class ToolOutput:
+    """Tool result with text and optional image, built-in tools return dictionaries that are sent as JSON text instead."""
+
+    def __init__(self, text, is_error=False, image_base64="", image_mime_type=""):
+        self.text = text
+        self.is_error = is_error
+        self.image_base64 = image_base64
+        self.image_mime_type = image_mime_type
+
+
 class Tool:
-    def __init__(self, name, description, input_schema, handler, read_only=False, idempotent=False):
+    def __init__(self, name, description, input_schema, handler, annotations=None):
         self.name = name
         self.description = description
         self.input_schema = input_schema
         self.handler = handler
-        self.annotations = {"read_only_hint": read_only}
-        if not read_only:
-            self.annotations["destructive_hint"] = False
-            self.annotations["idempotent_hint"] = idempotent
+        # Hints for clients, tools registered from C++ have none, because their behavior is not known.
+        self.annotations = annotations
+        # Created on server thread when tool is called first time.
+        self.validator = None
+
+
+READ_ONLY_HINTS = {"read_only_hint": True}
 
 
 SCENE_ID_SCHEMA = {
@@ -188,7 +201,7 @@ BUILT_IN_TOOLS = [
         "Scene with \"GameMode\" flag is a play mode copy of other scene.",
         {"type": "object", "properties": {}, "additionalProperties": False},
         list_scenes,
-        read_only=True,
+        READ_ONLY_HINTS,
     ),
     Tool(
         "list_entities",
@@ -204,7 +217,7 @@ BUILT_IN_TOOLS = [
             "additionalProperties": False,
         },
         list_entities,
-        read_only=True,
+        READ_ONLY_HINTS,
     ),
     Tool(
         "get_entity_transform",
@@ -217,7 +230,7 @@ BUILT_IN_TOOLS = [
             "additionalProperties": False,
         },
         get_entity_transform,
-        read_only=True,
+        READ_ONLY_HINTS,
     ),
     Tool(
         "set_entity_position",
@@ -237,6 +250,6 @@ BUILT_IN_TOOLS = [
             "additionalProperties": False,
         },
         set_entity_position,
-        idempotent=True,
+        {"read_only_hint": False, "destructive_hint": False, "idempotent_hint": True},
     ),
 ]

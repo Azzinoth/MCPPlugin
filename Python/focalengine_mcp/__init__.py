@@ -2,6 +2,6 @@
 
 Server runs on its own thread, engine is used only on main thread through focalengine.call_on_main_thread.
 """
-from .server import get_url, is_running, start, stop
+from .server import get_url, is_running, reload_native_tools, start, stop
 
-__all__ = ["start", "stop", "is_running", "get_url"]
+__all__ = ["start", "stop", "is_running", "get_url", "reload_native_tools"]

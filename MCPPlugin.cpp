@@ -12,6 +12,7 @@ namespace
 	// Clients show tool as mcp__focalengine__<name>, with this limit that full name fits in 64 characters.
 	const size_t MaximumToolNameLength = 46;
 	const size_t MaximumPropertyNameLength = 64;
+	const std::string NativeFunctionOwner = "MCPPlugin";
 
 	// Other port could be set, for example when other application already uses default one.
 	int GetPort()
@@ -58,14 +59,65 @@ namespace
 		return true;
 	}
 
+	bool ParseJSON(const std::string& Text, Json::Value& OutValue, std::string& OutError)
+	{
+		Json::CharReaderBuilder Builder;
+		const std::unique_ptr<Json::CharReader> Reader(Builder.newCharReader());
+		return Reader->parse(Text.c_str(), Text.c_str() + Text.size(), &OutValue, &OutError);
+	}
+
+	std::string ToCompactJSON(const Json::Value& Value)
+	{
+		Json::StreamWriterBuilder Builder;
+		Builder["indentation"] = "";
+		return Json::writeString(Builder, Value);
+	}
+
+	std::string EncodeBase64(const std::vector<unsigned char>& Data)
+	{
+		static const char Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+		std::string Result;
+		Result.reserve((Data.size() + 2) / 3 * 4);
+		for (size_t i = 0; i < Data.size(); i += 3)
+		{
+			const unsigned int Block = (Data[i] << 16) | ((i + 1 < Data.size() ? Data[i + 1] : 0) << 8) | (i + 2 < Data.size() ? Data[i + 2] : 0);
+			Result += Alphabet[(Block >> 18) & 63];
+			Result += Alphabet[(Block >> 12) & 63];
+			Result += i + 1 < Data.size() ? Alphabet[(Block >> 6) & 63] : '=';
+			Result += i + 2 < Data.size() ? Alphabet[Block & 63] : '=';
+		}
+
+		return Result;
+	}
+
+	MCPPluginInterface::ToolResult MakeErrorResult(const std::string& Text)
+	{
+		MCPPluginInterface::ToolResult Result;
+		Result.bIsError = true;
+		Result.Text = Text;
+		return Result;
+	}
+
+	std::string ToolResultToJSON(const MCPPluginInterface::ToolResult& Result)
+	{
+		Json::Value Output(Json::objectValue);
+		Output["is_error"] = Result.bIsError;
+		Output["text"] = Result.Text;
+		if (!Result.ImageData.empty())
+		{
+			Output["image_base64"] = EncodeBase64(Result.ImageData);
+			Output["image_mime_type"] = Result.ImageMIMEType.empty() ? std::string("image/png") : Result.ImageMIMEType;
+		}
+
+		return ToCompactJSON(Output);
+	}
+
 	// Clients reject whole tool list when one schema breaks their rules, so tool with such schema is not registered.
-	bool IsValidInputSchema(const std::string& InputJSONSchema, std::string& OutError)
+	bool ParseInputSchema(const std::string& InputJSONSchema, Json::Value& OutSchema, std::string& OutError)
 	{
 		Json::Value Root;
 		std::string ParseErrors;
-		Json::CharReaderBuilder Builder;
-		const std::unique_ptr<Json::CharReader> Reader(Builder.newCharReader());
-		if (!Reader->parse(InputJSONSchema.c_str(), InputJSONSchema.c_str() + InputJSONSchema.size(), &Root, &ParseErrors))
+		if (!ParseJSON(InputJSONSchema, Root, ParseErrors))
 		{
 			OutError = "it is not valid JSON: " + ParseErrors;
 			return false;
@@ -83,25 +135,26 @@ namespace
 			return false;
 		}
 
-		if (!Root.isMember("properties"))
-			return true;
-
-		if (!Root["properties"].isObject())
+		if (Root.isMember("properties"))
 		{
-			OutError = "\"properties\" should be JSON object";
-			return false;
-		}
-
-		const std::vector<std::string> PropertyNames = Root["properties"].getMemberNames();
-		for (size_t i = 0; i < PropertyNames.size(); i++)
-		{
-			if (!IsValidName(PropertyNames[i], MaximumPropertyNameLength, true))
+			if (!Root["properties"].isObject())
 			{
-				OutError = "property name \"" + PropertyNames[i] + "\" should have 1 to 64 characters from A-Z, a-z, 0-9, _, - and .";
+				OutError = "\"properties\" should be JSON object";
 				return false;
+			}
+
+			const std::vector<std::string> PropertyNames = Root["properties"].getMemberNames();
+			for (size_t i = 0; i < PropertyNames.size(); i++)
+			{
+				if (!IsValidName(PropertyNames[i], MaximumPropertyNameLength, true))
+				{
+					OutError = "property name \"" + PropertyNames[i] + "\" should have 1 to 64 characters from A-Z, a-z, 0-9, _, - and .";
+					return false;
+				}
 			}
 		}
 
+		OutSchema = Root;
 		return true;
 	}
 }
@@ -120,6 +173,16 @@ void MCPPlugin::OnUnload()
 {
 	StopServer();
 
+	if (bNativeFunctionsRegistered)
+	{
+		// PythonPlugin is unloaded after MCPPlugin, so it should not keep functions that point into this module.
+		PythonPluginInterface* Python = PLUGIN_MANAGER.GetPlugin<PythonPluginInterface>(UNIQUE_ID.FromString(PythonPluginInterface::PluginID));
+		if (Python != nullptr)
+			Python->UnregisterNativeFunctions(NativeFunctionOwner);
+
+		bNativeFunctionsRegistered = false;
+	}
+
 	// Owners unregister their tools before they are unloaded, handlers that are left could belong to modules that are already unloaded.
 	if (!Tools->empty())
 	{
@@ -131,6 +194,23 @@ void MCPPlugin::OnUnload()
 		static_cast<void>(Tools.release());
 		Tools = std::make_unique<std::map<std::string, RegisteredTool>>();
 	}
+}
+
+void MCPPlugin::OnUpdate(double DeltaTime)
+{
+	// Reload waits for next update, so many registrations cause one reload,
+	// and RegisterTool that is called from a tool handler does not call back into Python while handler runs.
+	if (!bToolsChanged || !bServerStarted || !bNativeFunctionsRegistered)
+		return;
+
+	bToolsChanged = false;
+	PythonPluginInterface* Python = FindPython();
+	if (Python == nullptr)
+		return;
+
+	const PythonPluginInterface::ExecutionResult Result = Python->RunString("import focalengine_mcp\nfocalengine_mcp.reload_native_tools()", true);
+	if (!Result.bSuccess)
+		LogExecutionError("OnUpdate", Result);
 }
 
 bool MCPPlugin::IsMainThread() const
@@ -204,7 +284,9 @@ bool MCPPlugin::StartServer(int Port)
 		return false;
 	}
 
-	// Returns right away, server reports to log when it listens.
+	RegisterNativeFunctions(Python);
+
+	// Returns right away, server reports to log when it listens. Tools registered from C++ are read during start.
 	const PythonPluginInterface::ExecutionResult Result = Python->RunString("import focalengine_mcp\nfocalengine_mcp.start(port=" + std::to_string(Port) + ")", true);
 	if (!Result.bSuccess)
 	{
@@ -214,7 +296,106 @@ bool MCPPlugin::StartServer(int Port)
 
 	bServerStarted = true;
 	ServerPort = Port;
+	bToolsChanged = false;
 	return true;
+}
+
+void MCPPlugin::RegisterNativeFunctions(PythonPluginInterface* Python)
+{
+	if (bNativeFunctionsRegistered)
+		return;
+
+	if (Python->GetInterfaceVersion() < 2)
+	{
+		LOG.Add("MCPPlugin::RegisterNativeFunctions: Tools registered with RegisterTool are not served, because they need PythonPlugin interface version 2, PythonPlugin has version " +
+				std::to_string(Python->GetInterfaceVersion()), "MCP_PLUGIN", FE_LOG_WARNING);
+		return;
+	}
+
+	bNativeFunctionsRegistered =
+		Python->RegisterNativeFunction(NativeFunctionOwner, "MCPPlugin.ListTools", [this](const std::string&) { return ListToolsAsJSON(); }) &&
+		Python->RegisterNativeFunction(NativeFunctionOwner, "MCPPlugin.CallTool", [this](const std::string& RequestJSON) { return CallToolFromJSON(RequestJSON); }) &&
+		Python->RegisterNativeFunction(NativeFunctionOwner, "MCPPlugin.SetReservedToolNames", [this](const std::string& NamesJSON) {
+			SetReservedToolNames(NamesJSON);
+			return std::string("{}");
+		});
+
+	if (!bNativeFunctionsRegistered)
+		Python->UnregisterNativeFunctions(NativeFunctionOwner);
+}
+
+std::string MCPPlugin::ListToolsAsJSON() const
+{
+	Json::Value Result(Json::arrayValue);
+	for (const auto& Tool : *Tools)
+	{
+		Json::Value Entry(Json::objectValue);
+		Entry["name"] = Tool.first;
+		Entry["description"] = Tool.second.Description;
+		Entry["input_schema"] = Tool.second.InputSchema;
+		Result.append(Entry);
+	}
+
+	return ToCompactJSON(Result);
+}
+
+std::string MCPPlugin::CallToolFromJSON(const std::string& RequestJSON)
+{
+	Json::Value Request;
+	std::string ParseError;
+	if (!ParseJSON(RequestJSON, Request, ParseError) || !Request.isObject() || !Request.isMember("name") || !Request["name"].isString())
+		return ToolResultToJSON(MakeErrorResult("Request should be JSON object with \"name\" and \"arguments_json\""));
+
+	const std::string Name = Request["name"].asString();
+	const auto Tool = Tools->find(Name);
+	if (Tool == Tools->end())
+		return ToolResultToJSON(MakeErrorResult("Tool \"" + Name + "\" is not registered anymore"));
+
+	// Copy keeps handler alive even if it unregisters its tool while it runs.
+	const ToolHandler Handler = Tool->second.Handler;
+	const std::string ArgumentsJSON = Request.isMember("arguments_json") && Request["arguments_json"].isString() ? Request["arguments_json"].asString() : std::string("{}");
+	try
+	{
+		return ToolResultToJSON(Handler(ArgumentsJSON));
+	}
+	catch (const std::exception& Exception)
+	{
+		return ToolResultToJSON(MakeErrorResult("Tool \"" + Name + "\" failed: " + Exception.what()));
+	}
+	catch (...)
+	{
+		return ToolResultToJSON(MakeErrorResult("Tool \"" + Name + "\" failed with unknown exception"));
+	}
+}
+
+void MCPPlugin::SetReservedToolNames(const std::string& NamesJSON)
+{
+	Json::Value Names;
+	std::string ParseError;
+	if (!ParseJSON(NamesJSON, Names, ParseError) || !Names.isArray())
+		return;
+
+	ReservedToolNames.clear();
+	for (Json::ArrayIndex i = 0; i < Names.size(); i++)
+	{
+		if (Names[i].isString())
+			ReservedToolNames.insert(Names[i].asString());
+	}
+
+	// Tools registered before server started first time could not be checked against these names.
+	auto Iterator = Tools->begin();
+	while (Iterator != Tools->end())
+	{
+		if (ReservedToolNames.count(Iterator->first) > 0)
+		{
+			LOG.Add("MCPPlugin: Tool \"" + Iterator->first + "\" of \"" + Iterator->second.OwnerName + "\" is unregistered, because built-in tool of MCP server has that name", "MCP_PLUGIN", FE_LOG_ERROR);
+			Iterator = Tools->erase(Iterator);
+		}
+		else
+		{
+			Iterator++;
+		}
+	}
 }
 
 void MCPPlugin::StopServer()
@@ -277,14 +458,21 @@ bool MCPPlugin::RegisterTool(const std::string& OwnerName, const std::string& Na
 		return false;
 	}
 
+	if (ReservedToolNames.count(Name) > 0)
+	{
+		LOG.Add("MCPPlugin::RegisterTool: Tool \"" + Name + "\" of \"" + OwnerName + "\" is not registered, because built-in tool of MCP server has that name", "MCP_PLUGIN", FE_LOG_ERROR);
+		return false;
+	}
+
 	if (!Handler)
 	{
 		LOG.Add("MCPPlugin::RegisterTool: Tool \"" + Name + "\" of \"" + OwnerName + "\" is not registered, because its handler is empty", "MCP_PLUGIN", FE_LOG_ERROR);
 		return false;
 	}
 
+	Json::Value InputSchema;
 	std::string SchemaError;
-	if (!IsValidInputSchema(InputJSONSchema, SchemaError))
+	if (!ParseInputSchema(InputJSONSchema, InputSchema, SchemaError))
 	{
 		LOG.Add("MCPPlugin::RegisterTool: Tool \"" + Name + "\" of \"" + OwnerName + "\" is not registered, because its input schema is not valid: " + SchemaError, "MCP_PLUGIN", FE_LOG_ERROR);
 		return false;
@@ -297,7 +485,8 @@ bool MCPPlugin::RegisterTool(const std::string& OwnerName, const std::string& Na
 		return false;
 	}
 
-	(*Tools)[Name] = RegisteredTool{ OwnerName, Description, InputJSONSchema, std::move(Handler) };
+	(*Tools)[Name] = RegisteredTool{ OwnerName, Description, InputSchema, std::move(Handler) };
+	bToolsChanged = true;
 	return true;
 }
 
@@ -309,7 +498,11 @@ bool MCPPlugin::UnregisterTool(const std::string& Name)
 		return false;
 	}
 
-	return Tools->erase(Name) > 0;
+	if (Tools->erase(Name) == 0)
+		return false;
+
+	bToolsChanged = true;
+	return true;
 }
 
 void MCPPlugin::UnregisterToolsOfOwner(const std::string& OwnerName)
@@ -326,6 +519,7 @@ void MCPPlugin::UnregisterToolsOfOwner(const std::string& OwnerName)
 		if (Iterator->second.OwnerName == OwnerName)
 		{
 			Iterator = Tools->erase(Iterator);
+			bToolsChanged = true;
 		}
 		else
 		{

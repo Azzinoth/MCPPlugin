@@ -5,6 +5,7 @@
 #include "Public/MCPPluginInterface.h"
 #include <map>
 #include <memory>
+#include <set>
 #include <thread>
 using namespace FocalEngine;
 
@@ -13,6 +14,7 @@ class MCPPlugin : public FEPluginCore, public MCPPluginInterface
 public:
 	void OnLoad() override;
 	void OnUnload() override;
+	void OnUpdate(double DeltaTime) override;
 
 	bool StartServer(int Port) override;
 	void StopServer() override;
@@ -26,12 +28,17 @@ private:
 	bool bServerStarted = false;
 	int ServerPort = 0;
 	std::thread::id MainThreadID;
+	// Python server reaches tools registered from C++ through native functions of PythonPlugin.
+	bool bNativeFunctionsRegistered = false;
+	bool bToolsChanged = false;
+	// Names of built-in tools of Python server, they are known after server started first time.
+	std::set<std::string> ReservedToolNames;
 
 	struct RegisteredTool
 	{
 		std::string OwnerName;
 		std::string Description;
-		std::string InputJSONSchema;
+		Json::Value InputSchema;
 		ToolHandler Handler;
 	};
 	// Allocated separately, so tools that owners did not unregister could be leaked on unload,
@@ -41,4 +48,9 @@ private:
 	bool IsMainThread() const;
 	// Returns nullptr if PythonPlugin is not loaded or Python failed to start.
 	PythonPluginInterface* FindPython();
+
+	void RegisterNativeFunctions(PythonPluginInterface* Python);
+	std::string ListToolsAsJSON() const;
+	std::string CallToolFromJSON(const std::string& RequestJSON);
+	void SetReservedToolNames(const std::string& NamesJSON);
 };

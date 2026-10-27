@@ -8,7 +8,6 @@ import site
 import socket
 import sys
 import threading
-import weakref
 
 import focalengine
 
@@ -30,6 +29,10 @@ GRACEFUL_SHUTDOWN_TIMEOUT_IN_SECONDS = 2
 LOGGER_NAMES = ("focalengine_mcp", "mcp", "uvicorn", "asyncio", "sse_starlette")
 # Some packages could not be loaded again after Python was finalized and initialized in the same process.
 IMPORT_MARKER = "FOCAL_ENGINE_MCP_PACKAGES_IMPORTED"
+# Native functions that MCPPlugin registers in PythonPlugin, through them server serves tools that applications and plugins registered from C++.
+LIST_NATIVE_TOOLS_FUNCTION = "MCPPlugin.ListTools"
+CALL_NATIVE_TOOL_FUNCTION = "MCPPlugin.CallTool"
+SET_RESERVED_TOOL_NAMES_FUNCTION = "MCPPlugin.SetReservedToolNames"
 
 logger = logging.getLogger("focalengine_mcp")
 _server = None
@@ -104,12 +107,21 @@ def _bind_socket(port):
     return listening_socket
 
 
+def _make_native_tool_handler(name):
+    def handle(arguments):
+        # Arguments stay text, so C++ handler gets numbers exactly as client sent them.
+        output = json.loads(focalengine.call_native_function(CALL_NATIVE_TOOL_FUNCTION, json.dumps({"name": name, "arguments_json": json.dumps(arguments)})))
+        return tools.ToolOutput(output.get("text", ""), output.get("is_error", False), output.get("image_base64", ""), output.get("image_mime_type", ""))
+
+    return handle
+
+
 class _EngineServer:
     def __init__(self, port):
         self.port = port
         self.url = f"http://{HOST}:{port}/mcp"
+        # Replaced as a whole when tools change, so server thread always reads complete dictionary.
         self.tools = {tool.name: tool for tool in tools.BUILT_IN_TOOLS}
-        self.validators = {}
         self.socket = None
         self.thread = None
         self.loop = None
@@ -117,7 +129,8 @@ class _EngineServer:
         self.listen_handler = None
         self.subscription_bus = None
         # Sessions of handshake-era clients, they get tools/list_changed directly instead of through subscriptions/listen.
-        self.sessions = weakref.WeakValueDictionary()
+        # Session object is created for every request, so the last one of each session ID is kept, sessions that could not be reached are removed.
+        self.sessions = {}
         self.pending_futures = set()
         self.pending_futures_lock = threading.Lock()
         self.stopping = threading.Event()
@@ -151,6 +164,24 @@ class _EngineServer:
                 self.shutdown_callback_id = None
             self.thread = None
             raise
+
+    def load_native_tools(self):
+        """Runs on main thread, adds tools registered from C++ to built-in tools."""
+        # PythonPlugin before interface version 2 has no native functions.
+        if not hasattr(focalengine, "get_native_function_names") or LIST_NATIVE_TOOLS_FUNCTION not in focalengine.get_native_function_names():
+            return
+
+        built_in_tools = {tool.name: tool for tool in tools.BUILT_IN_TOOLS}
+        focalengine.call_native_function(SET_RESERVED_TOOL_NAMES_FUNCTION, json.dumps(sorted(built_in_tools)))
+        all_tools = dict(built_in_tools)
+        for description in json.loads(focalengine.call_native_function(LIST_NATIVE_TOOLS_FUNCTION)):
+            name = description["name"]
+            if name in built_in_tools:
+                logger.warning("Tool %s registered from C++ is not served, because built-in tool has the same name", name)
+                continue
+
+            all_tools[name] = tools.Tool(name, description.get("description", ""), description["input_schema"], _make_native_tool_handler(name))
+        self.tools = all_tools
 
     def _filter_stopping_noise(self, record):
         # uvicorn reports open SSE streams that stop() ends as unfinished responses.
@@ -216,7 +247,7 @@ class _EngineServer:
         from mcp.server.transport_security import TransportSecuritySettings
 
         self.types = mcp_types
-        self.validators = {name: jsonschema.Draft202012Validator(tool.input_schema) for name, tool in self.tools.items()}
+        self.jsonschema = jsonschema
         self.subscription_bus = InMemorySubscriptionBus()
         self.listen_handler = ListenHandler(self.subscription_bus)
 
@@ -257,7 +288,8 @@ class _EngineServer:
     async def _list_tools(self, context, params):
         types = self.types
         return types.ListToolsResult(tools=[
-            types.Tool(name=tool.name, description=tool.description, input_schema=tool.input_schema, annotations=types.ToolAnnotations(**tool.annotations))
+            types.Tool(name=tool.name, description=tool.description, input_schema=tool.input_schema,
+                       annotations=types.ToolAnnotations(**tool.annotations) if tool.annotations else None)
             for tool in self.tools.values()
         ])
 
@@ -267,7 +299,9 @@ class _EngineServer:
             return self._error_result(f"Unknown tool {params.name}")
 
         arguments = params.arguments or {}
-        errors = list(self.validators[tool.name].iter_errors(arguments))
+        if tool.validator is None:
+            tool.validator = self.jsonschema.Draft202012Validator(tool.input_schema)
+        errors = list(tool.validator.iter_errors(arguments))
         if errors:
             return self._error_result("Invalid arguments: " + "; ".join(error.message for error in errors[:5]))
 
@@ -281,6 +315,14 @@ class _EngineServer:
             return self._error_result(str(error))
         except Exception as error:
             return self._error_result(f"{type(error).__name__}: {error}")
+
+        if isinstance(result, tools.ToolOutput):
+            content = []
+            if result.text or not result.image_base64:
+                content.append(self.types.TextContent(text=result.text))
+            if result.image_base64:
+                content.append(self.types.ImageContent(data=result.image_base64, mime_type=result.image_mime_type))
+            return self.types.CallToolResult(content=content, is_error=result.is_error)
 
         return self.types.CallToolResult(content=[self.types.TextContent(text=json.dumps(result, ensure_ascii=False))])
 
@@ -373,6 +415,7 @@ class _EngineServer:
             sse.AppStatus.should_exit = False
 
         self.socket.close()
+        self.sessions.clear()
         if self.shutdown_callback_id is not None:
             focalengine.remove_callback(self.shutdown_callback_id)
             self.shutdown_callback_id = None
@@ -405,6 +448,7 @@ def start(port=5187):
         site.addsitedir(packages_directory)
 
     server = _EngineServer(port)
+    server.load_native_tools()
     server.start()
     _server = server
 
@@ -420,6 +464,15 @@ def stop(timeout=3.0):
         _server = None
 
     return stopped
+
+
+def reload_native_tools():
+    """MCPPlugin calls it on main thread when tools registered from C++ changed, clients are told that tool list changed."""
+    if _server is None or not _server.is_running():
+        return
+
+    _server.load_native_tools()
+    _server.notify_tools_changed()
 
 
 def is_running():
