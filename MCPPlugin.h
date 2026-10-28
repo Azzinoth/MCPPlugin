@@ -12,7 +12,7 @@ using namespace FocalEngine;
 class MCPPlugin : public FEPluginCore, public MCPPluginInterface
 {
 public:
-	void OnLoad() override;
+	bool OnLoad() override;
 	void OnUnload() override;
 	void OnUpdate(double DeltaTime) override;
 

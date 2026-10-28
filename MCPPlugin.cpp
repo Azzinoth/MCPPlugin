@@ -247,7 +247,7 @@ namespace
 	}
 }
 
-void MCPPlugin::OnLoad()
+bool MCPPlugin::OnLoad()
 {
 	MainThreadID = std::this_thread::get_id();
 
@@ -255,6 +255,7 @@ void MCPPlugin::OnLoad()
 #ifdef FOCAL_ENGINE_SHARED
 	StartServer(GetPort());
 #endif
+	return true;
 }
 
 void MCPPlugin::OnUnload()

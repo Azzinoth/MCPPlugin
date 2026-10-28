@@ -15,7 +15,7 @@ from . import tools
 
 HOST = "127.0.0.1"
 SERVER_NAME = "focalengine"
-SERVER_VERSION = "1.0.1"
+SERVER_VERSION = "1.0.2"
 INSTRUCTIONS = (
     "Tools of a running Focal Engine application. Y axis is up. Positions are absolute. "
     "Rotations are Euler angles in degrees, applied around X, then Y, then Z. "
