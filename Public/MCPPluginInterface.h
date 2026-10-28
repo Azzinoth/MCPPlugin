@@ -25,9 +25,11 @@ public:
 		// Error text is shown to the model, so it could correct its call.
 		bool bIsError = false;
 		std::string Text;
-		// Optional encoded image, for example PNG or JPEG file data, sent together with Text.
-		std::vector<unsigned char> ImageData;
-		std::string ImageMIMEType;
+		// Optional image sent together with Text, RGBA with 8 bits per channel, rows go from top to bottom.
+		// Plugin scales it down and compresses it to JPEG, because clients reject large tool results.
+		std::vector<unsigned char> ImagePixels;
+		int ImageWidth = 0;
+		int ImageHeight = 0;
 	};
 	using ToolHandler = std::function<ToolResult(const std::string& ArgumentsJSON)>;
 

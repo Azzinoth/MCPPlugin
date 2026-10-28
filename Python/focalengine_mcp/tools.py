@@ -1,10 +1,13 @@
 """Built-in tools, their handlers run on main thread, because engine could be used only there."""
+import json
+
 import focalengine
 
 # Engine and editor mark their own objects with these tags, tools neither list them nor change them.
 PRIVATE_TAGS = frozenset(("EDITOR_PRIVATE_RESOURCE", "ENGINE_PRIVATE_RESOURCE", "PREFAB_DESCRIPTION"))
 DEFAULT_LIST_LIMIT = 200
 MAXIMUM_LIST_LIMIT = 1000
+CAPTURE_SCENE_SCREENSHOT_FUNCTION = "MCPPlugin.CaptureSceneScreenshot"
 
 
 class ToolError(Exception):
@@ -12,7 +15,7 @@ class ToolError(Exception):
 
 
 class ToolOutput:
-    """Tool result with text and optional image, built-in tools return dictionaries that are sent as JSON text instead."""
+    """Tool result with text and optional image, most built-in tools return dictionaries that are sent as JSON text instead."""
 
     def __init__(self, text, is_error=False, image_base64="", image_mime_type=""):
         self.text = text
@@ -125,6 +128,12 @@ def _to_list(vector):
     return [round(vector.x, 6), round(vector.y, 6), round(vector.z, 6)]
 
 
+def call_native_tool_function(name, request):
+    """Calls C++ function that returns tool result as JSON, such result could carry image."""
+    output = json.loads(focalengine.call_native_function(name, json.dumps(request)))
+    return ToolOutput(output.get("text", ""), output.get("is_error", False), output.get("image_base64", ""), output.get("image_mime_type", ""))
+
+
 def list_scenes(arguments):
     starting_scene = focalengine.get_starting_scene()
     focused_scene = _get_focused_scene()
@@ -185,6 +194,14 @@ def get_entity_transform(arguments):
     }
 
 
+def capture_scene_screenshot(arguments):
+    scene = _get_scene(arguments.get("scene_id"))
+    if focalengine.get_graphics_mode() == "None":
+        raise ToolError("Scenes are not rendered in applications without graphics")
+
+    return call_native_tool_function(CAPTURE_SCENE_SCREENSHOT_FUNCTION, {"scene_id": scene.id})
+
+
 def set_entity_position(arguments):
     scene, entity = resolve_entity(arguments, for_write=True)
     world = _use_world_space(arguments)
@@ -230,6 +247,13 @@ BUILT_IN_TOOLS = [
             "additionalProperties": False,
         },
         get_entity_transform,
+        READ_ONLY_HINTS,
+    ),
+    Tool(
+        "capture_scene_screenshot",
+        "Captures what main camera of a scene shows, in the editor it is the scene view. Image is JPEG, large images are scaled down.",
+        {"type": "object", "properties": {"scene_id": SCENE_ID_SCHEMA}, "additionalProperties": False},
+        capture_scene_screenshot,
         READ_ONLY_HINTS,
     ),
     Tool(

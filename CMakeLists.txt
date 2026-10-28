@@ -112,6 +112,8 @@ file(GLOB Connection_To_Engine_SRC
 file(GLOB Main_SRC
 	"MCPPlugin.h"
 	"MCPPlugin.cpp"
+	"ToolImageEncoder.h"
+	"ToolImageEncoder.cpp"
 	"SubSystems/PythonPlugin/PythonPluginInterface.h"
 )
 

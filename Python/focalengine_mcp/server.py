@@ -15,7 +15,7 @@ from . import tools
 
 HOST = "127.0.0.1"
 SERVER_NAME = "focalengine"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.0.1"
 INSTRUCTIONS = (
     "Tools of a running Focal Engine application. Y axis is up. Positions are absolute. "
     "Rotations are Euler angles in degrees, applied around X, then Y, then Z. "
@@ -110,8 +110,7 @@ def _bind_socket(port):
 def _make_native_tool_handler(name):
     def handle(arguments):
         # Arguments stay text, so C++ handler gets numbers exactly as client sent them.
-        output = json.loads(focalengine.call_native_function(CALL_NATIVE_TOOL_FUNCTION, json.dumps({"name": name, "arguments_json": json.dumps(arguments)})))
-        return tools.ToolOutput(output.get("text", ""), output.get("is_error", False), output.get("image_base64", ""), output.get("image_mime_type", ""))
+        return tools.call_native_tool_function(CALL_NATIVE_TOOL_FUNCTION, {"name": name, "arguments_json": json.dumps(arguments)})
 
     return handle
 

@@ -1,4 +1,7 @@
 #include "MCPPlugin.h"
+#include "ToolImageEncoder.h"
+#include "glm/gtc/packing.hpp"
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 
@@ -103,13 +106,98 @@ namespace
 		Json::Value Output(Json::objectValue);
 		Output["is_error"] = Result.bIsError;
 		Output["text"] = Result.Text;
-		if (!Result.ImageData.empty())
+		if (!Result.ImagePixels.empty())
 		{
-			Output["image_base64"] = EncodeBase64(Result.ImageData);
-			Output["image_mime_type"] = Result.ImageMIMEType.empty() ? std::string("image/png") : Result.ImageMIMEType;
+			std::vector<unsigned char> JPEG;
+			std::string ImageError;
+			if (ToolImageEncoder::EncodeAsJPEG(Result.ImagePixels, Result.ImageWidth, Result.ImageHeight, JPEG, ImageError))
+			{
+				Output["image_base64"] = EncodeBase64(JPEG);
+				Output["image_mime_type"] = "image/jpeg";
+			}
+			else
+			{
+				// Otherwise model would not know that result is incomplete.
+				Output["is_error"] = true;
+				Output["text"] = Result.Text + (Result.Text.empty() ? "" : "\n") + "Image of result is not sent, because " + ImageError;
+			}
 		}
 
 		return ToCompactJSON(Output);
+	}
+
+	// Result is RGBA with 8 bits per channel and rows from top to bottom, as ToolResult expects.
+	bool ReadTexturePixels(FETexture* Texture, std::vector<unsigned char>& OutPixels, std::string& OutError)
+	{
+		const GLint Format = Texture->GetInternalFormat();
+		if (Format != GL_RGBA && Format != GL_RGBA16F)
+		{
+			OutError = "its texture format " + FETexture::TextureInternalFormatToString(Format) + " is not supported";
+			return false;
+		}
+
+		unsigned char* RawData = Texture->GetRawData();
+		if (RawData == nullptr)
+		{
+			OutError = "texture could not be read, engine log has the reason";
+			return false;
+		}
+
+		const size_t Width = static_cast<size_t>(Texture->GetWidth());
+		const size_t Height = static_cast<size_t>(Texture->GetHeight());
+		const unsigned short* HalfFloats = reinterpret_cast<const unsigned short*>(RawData);
+		OutPixels.resize(Width * Height * 4);
+		for (size_t y = 0; y < Height; y++)
+		{
+			// Rows of OpenGL textures go from bottom to top.
+			const size_t SourceRow = (Height - 1 - y) * Width * 4;
+			const size_t TargetRow = y * Width * 4;
+			for (size_t i = 0; i < Width * 4; i++)
+			{
+				if (Format == GL_RGBA)
+				{
+					OutPixels[TargetRow + i] = RawData[SourceRow + i];
+				}
+				else
+				{
+					// NaN fails comparison and becomes 0.
+					const float Value = glm::unpackHalf1x16(HalfFloats[SourceRow + i]);
+					OutPixels[TargetRow + i] = static_cast<unsigned char>((Value > 0.0f ? std::min(Value, 1.0f) : 0.0f) * 255.0f + 0.5f);
+				}
+			}
+		}
+
+		delete[] RawData;
+		return true;
+	}
+
+	// Python tool picks scene, because only Python side knows which scene is focused in the editor.
+	MCPPluginInterface::ToolResult CaptureSceneScreenshot(const std::string& RequestJSON)
+	{
+		Json::Value Request;
+		std::string ParseError;
+		if (!ParseJSON(RequestJSON, Request, ParseError) || !Request.isObject() || !Request.isMember("scene_id") || !Request["scene_id"].isString())
+			return MakeErrorResult("Request should be JSON object with \"scene_id\"");
+
+		const std::string SceneID = Request["scene_id"].asString();
+		FEScene* Scene = SCENE_MANAGER.GetSceneByID(UNIQUE_ID.FromString(SceneID));
+		if (Scene == nullptr)
+			return MakeErrorResult("Scene " + SceneID + " does not exist, list_scenes shows existing scenes");
+
+		// RENDERER.CreateScreenshot is not used, its copy is compressed to DXT.
+		FETexture* CameraResult = RENDERER.GetCameraResult(CAMERA_SYSTEM.GetMainCamera(Scene));
+		if (CameraResult == nullptr)
+			return MakeErrorResult("Scene " + SceneID + " has no image, because it has no main camera or its main camera did not render yet");
+
+		MCPPluginInterface::ToolResult Result;
+		std::string ReadError;
+		if (!ReadTexturePixels(CameraResult, Result.ImagePixels, ReadError))
+			return MakeErrorResult("Image of scene " + SceneID + " could not be read, because " + ReadError);
+
+		Result.Text = "Scene " + SceneID + " as its main camera sees it";
+		Result.ImageWidth = CameraResult->GetWidth();
+		Result.ImageHeight = CameraResult->GetHeight();
+		return Result;
 	}
 
 	// Clients reject whole tool list when one schema breaks their rules, so tool with such schema is not registered.
@@ -318,7 +406,8 @@ void MCPPlugin::RegisterNativeFunctions(PythonPluginInterface* Python)
 		Python->RegisterNativeFunction(NativeFunctionOwner, "MCPPlugin.SetReservedToolNames", [this](const std::string& NamesJSON) {
 			SetReservedToolNames(NamesJSON);
 			return std::string("{}");
-		});
+		}) &&
+		Python->RegisterNativeFunction(NativeFunctionOwner, "MCPPlugin.CaptureSceneScreenshot", [](const std::string& RequestJSON) { return ToolResultToJSON(CaptureSceneScreenshot(RequestJSON)); });
 
 	if (!bNativeFunctionsRegistered)
 		Python->UnregisterNativeFunctions(NativeFunctionOwner);
